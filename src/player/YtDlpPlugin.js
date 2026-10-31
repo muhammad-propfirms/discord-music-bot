@@ -6,6 +6,38 @@ const config = require('../config/config');
 
 const SPOTIFY_RE = /^https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?(track|album|playlist|artist)\//i;
 
+/**
+ * Only links to these music sites are accepted. yt-dlp would otherwise fetch any
+ * URL a Discord user types (including internal/cloud-metadata addresses) from the
+ * server - a server-side request forgery risk. Subdomains are allowed.
+ */
+const ALLOWED_HOSTS = [
+    'youtube.com', 'youtu.be', 'youtube-nocookie.com',
+    'soundcloud.com',
+    'bandcamp.com',
+    'open.spotify.com',
+    'vimeo.com',
+    'twitch.tv',
+    'mixcloud.com',
+    'audiomack.com',
+    'deezer.com',
+    'dailymotion.com',
+    ...(process.env.EXTRA_ALLOWED_HOSTS || '').split(',').map(h => h.trim().toLowerCase()).filter(Boolean),
+];
+
+function isAllowedUrl(input) {
+    let url;
+    try {
+        url = new URL(input);
+    } catch {
+        return false;
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+    if (url.username || url.password || (url.port && url.port !== '80' && url.port !== '443')) return false;
+    const host = url.hostname.toLowerCase().replace(/\.$/, '');
+    return ALLOWED_HOSTS.some(allowed => host === allowed || host.endsWith(`.${allowed}`));
+}
+
 function thumbnailOf(info) {
     if (info.thumbnail) return info.thumbnail;
     const thumbs = info.thumbnails;
@@ -32,7 +64,7 @@ class YtDlpPlugin extends ExtractorPlugin {
     }
 
     validate(url) {
-        return /^https?:\/\//i.test(url);
+        return isAllowedUrl(url);
     }
 
     toSong(info, options) {
@@ -57,6 +89,7 @@ class YtDlpPlugin extends ExtractorPlugin {
     }
 
     async resolve(url, options) {
+        if (!isAllowedUrl(url)) throw new DisTubeError('YTDLP_ERROR', 'Links from that website are not allowed.');
         const spotify = SPOTIFY_RE.exec(url);
         if (spotify) return this.#resolveSpotify(url, spotify[1].toLowerCase(), options);
 
@@ -138,4 +171,6 @@ class YtDlpPlugin extends ExtractorPlugin {
     }
 }
 
+YtDlpPlugin.isAllowedUrl = isAllowedUrl;
+YtDlpPlugin.ALLOWED_HOSTS = ALLOWED_HOSTS;
 module.exports = YtDlpPlugin;

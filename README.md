@@ -1,6 +1,6 @@
 # Discord Music Bot (self-hosted, for friends)
 
-A private Discord music bot for your own server. It plays music from YouTube, YouTube Music, SoundCloud, Bandcamp and about 1,800 other sites through **yt-dlp**, and from Spotify track links (matched on YouTube). Everything is driven by slash commands.
+A private Discord music bot for your own server. It plays music from YouTube, YouTube Music, SoundCloud, Bandcamp, Vimeo, Twitch, Mixcloud, Audiomack, Deezer and Dailymotion through **yt-dlp**, and from Spotify track links (matched on YouTube). Everything is driven by slash commands. Links to other sites are rejected so users can't make the server fetch arbitrary URLs; add more domains with `EXTRA_ALLOWED_HOSTS`.
 
 **📄 Full step-by-step guide (PDF): [`docs/Music-Bot-Setup-Guide.pdf`](docs/Music-Bot-Setup-Guide.pdf)**
 

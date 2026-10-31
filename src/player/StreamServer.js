@@ -52,24 +52,23 @@ class StreamServer extends EventEmitter {
         for (const url of this.prefetches.keys()) this.#dropPrefetch(url);
 
         const proc = ytdlp.spawnAudio(songUrl);
-        const entry = { proc, chunks: [], size: 0, done: false, failed: false, listeners: new Set(), timer: null };
+        const entry = { proc, chunks: [], size: 0, done: false, failed: false, timer: null, onData: null };
         entry.timer = setTimeout(() => this.#dropPrefetch(songUrl), PREFETCH_TTL_MS);
         entry.timer.unref();
         this.prefetches.set(songUrl, entry);
 
-        const notify = () => entry.listeners.forEach(fn => fn());
-        proc.stdout.on('data', chunk => {
+        // Buffering in memory only happens before handoff, and is capped.
+        entry.onData = chunk => {
             entry.chunks.push(chunk);
             entry.size += chunk.length;
-            notify();
             if (entry.size > PREFETCH_MAX_BYTES) this.#dropPrefetch(songUrl);
-        });
+        };
+        proc.stdout.on('data', entry.onData);
         proc.stderr.on('data', () => {});
-        proc.on('error', () => { entry.failed = true; notify(); });
+        proc.on('error', () => { entry.failed = true; });
         proc.on('close', code => {
             entry.done = true;
             if (code !== 0 && entry.size === 0) entry.failed = true;
-            notify();
         });
     }
 
@@ -78,9 +77,10 @@ class StreamServer extends EventEmitter {
         if (!entry) return;
         this.prefetches.delete(songUrl);
         clearTimeout(entry.timer);
-        if (!entry.done) entry.proc.kill();
+        entry.proc.stdout.off('data', entry.onData);
+        entry.chunks = [];
         entry.failed = true;
-        entry.listeners.forEach(fn => fn());
+        if (!entry.done) entry.proc.kill();
     }
 
     #handle(req, res) {
@@ -137,35 +137,23 @@ class StreamServer extends EventEmitter {
     }
 
     #serveFromPrefetch(entry, req, res) {
-        let index = 0;
-        let closed = false;
-        let waiting = false;
-        const pump = () => {
-            if (closed || waiting) return;
-            while (index < entry.chunks.length) {
-                const ok = res.write(entry.chunks[index]);
-                entry.chunks[index] = null; // free memory as we go
-                index++;
-                if (!ok) {
-                    waiting = true;
-                    res.once('drain', () => { waiting = false; pump(); });
-                    return;
-                }
-            }
-            if (entry.done || entry.failed) {
-                entry.listeners.delete(pump);
-                res.end();
-            }
-        };
-        entry.listeners.add(pump);
-        const cleanup = () => {
-            closed = true;
-            entry.listeners.delete(pump);
-            if (!entry.done) entry.proc.kill();
-        };
+        const { proc } = entry;
+        // Stop buffering into memory, send what was prefetched (at most PREFETCH_MAX_BYTES),
+        // then pipe the rest so normal backpressure applies and memory stays bounded.
+        proc.stdout.pause();
+        proc.stdout.off('data', entry.onData);
+        const buffered = entry.chunks;
+        entry.chunks = [];
+        for (const chunk of buffered) res.write(chunk);
+
+        if (entry.done || proc.stdout.readableEnded) {
+            res.end();
+        } else {
+            proc.stdout.pipe(res);
+        }
+        const cleanup = () => { if (proc.exitCode === null) proc.kill(); };
         req.on('close', cleanup);
         res.on('close', cleanup);
-        pump();
     }
 
     stop() {

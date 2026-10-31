@@ -2,6 +2,7 @@
 
 const { SlashCommandBuilder } = require('discord.js');
 const { Playlist } = require('distube');
+const YtDlpPlugin = require('../player/YtDlpPlugin');
 const { respond, requireVoice, friendlyError, truncate } = require('../utils/helpers');
 
 module.exports = {
@@ -32,6 +33,11 @@ module.exports = {
 
 /** Resolve a query/URL, add it to the queue and edit the deferred reply. Shared with /search. */
 async function playAndReport(interaction, distube, channel, query, next = false) {
+    // Reject links to other sites up front: DisTube would otherwise send a request to them.
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(query) && !YtDlpPlugin.isAllowedUrl(query)) {
+        return respond(interaction, 'warn',
+            '🚫 Only links from YouTube, SoundCloud, Bandcamp, Spotify (tracks), Vimeo, Twitch, Mixcloud, Audiomack, Deezer and Dailymotion are supported. Or just type the song name.');
+    }
     let item;
     try {
         item = await distube.handler.resolve(query, { member: interaction.member });
