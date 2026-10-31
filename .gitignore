@@ -1,0 +1,10 @@
+node_modules/
+bin/
+.env
+.env.*
+!.env.example
+cookies.txt
+*.cookies.txt
+*.log
+.DS_Store
+Thumbs.db

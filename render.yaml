@@ -1,0 +1,34 @@
+# Render Blueprint: Render reads this file automatically when you create a
+# "Blueprint" from this repo (Dashboard -> New -> Blueprint). It creates the
+# service with the right settings and asks you for the secret values below.
+services:
+  - type: web            # "web" is the only type on Render's free plan. The bot answers /healthz on $PORT.
+    name: discord-music-bot
+    runtime: node
+    plan: free           # change to "starter" for a paid instance that never sleeps
+    region: oregon       # pick the region closest to you and your friends
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # --- You will be asked for these when you create the Blueprint ---
+      - key: TOKEN               # REQUIRED. Discord bot token (Developer Portal -> Bot -> Reset Token)
+        sync: false
+      - key: GUILD_ID            # Optional. Your server ID. Leave blank = every server the bot is in.
+        sync: false
+      - key: ALLOWED_ROLE_IDS    # Optional. Only members with one of these role IDs can use the bot. Blank = everyone.
+        sync: false
+      # --- Pre-filled defaults (you can change them later in Environment) ---
+      - key: NODE_VERSION
+        value: "24"
+      - key: DEFAULT_VOLUME
+        value: "50"
+      - key: MAX_PLAYLIST_SIZE
+        value: "100"
+      - key: LEAVE_WHEN_ALONE_AFTER
+        value: "60"
+      - key: LEAVE_WHEN_IDLE_AFTER
+        value: "300"
+      - key: YTDLP_AUTO_UPDATE
+        value: "true"
