@@ -122,6 +122,8 @@ function baseArgs() {
         '--no-warnings',
         '--no-progress',
         '--js-runtimes', `node:${process.execPath}`,
+        // Never fall back to the "generic" extractor, which would download any web page.
+        '--use-extractors', 'default,-generic',
     ];
     const cookies = cookiesFile();
     if (cookies) args.push('--cookies', cookies);

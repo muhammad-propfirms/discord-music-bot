@@ -25,17 +25,33 @@ const ALLOWED_HOSTS = [
     ...(process.env.EXTRA_ALLOWED_HOSTS || '').split(',').map(h => h.trim().toLowerCase()).filter(Boolean),
 ];
 
-function isAllowedUrl(input) {
+/**
+ * Returns the normalized URL if it points to an allowed site, otherwise null.
+ * Callers must pass the returned string (not the raw input) on to yt-dlp, so
+ * the URL that was checked is exactly the URL that gets fetched. Characters
+ * that different URL parsers disagree on (backslashes, whitespace, control
+ * characters) are rejected outright.
+ */
+function normalizeAllowedUrl(input) {
+    if (typeof input !== 'string' || input.length > 2048) return null;
+    // eslint-disable-next-line no-control-regex
+    if (/[\\\s\u0000-\u001f\u007f]/.test(input)) return null;
     let url;
     try {
         url = new URL(input);
     } catch {
-        return false;
+        return null;
     }
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
-    if (url.username || url.password || (url.port && url.port !== '80' && url.port !== '443')) return false;
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+    if (url.username || url.password || (url.port && url.port !== '80' && url.port !== '443')) return null;
     const host = url.hostname.toLowerCase().replace(/\.$/, '');
-    return ALLOWED_HOSTS.some(allowed => host === allowed || host.endsWith(`.${allowed}`));
+    if (!/^[a-z0-9.-]+$/.test(host)) return null; // no IP-literal tricks, IDN or percent-encoding
+    if (!ALLOWED_HOSTS.some(allowed => host === allowed || host.endsWith(`.${allowed}`))) return null;
+    return url.href;
+}
+
+function isAllowedUrl(input) {
+    return normalizeAllowedUrl(input) !== null;
 }
 
 function thumbnailOf(info) {
@@ -88,8 +104,9 @@ class YtDlpPlugin extends ExtractorPlugin {
         }, options);
     }
 
-    async resolve(url, options) {
-        if (!isAllowedUrl(url)) throw new DisTubeError('YTDLP_ERROR', 'Links from that website are not allowed.');
+    async resolve(rawUrl, options) {
+        const url = normalizeAllowedUrl(rawUrl);
+        if (!url) throw new DisTubeError('YTDLP_ERROR', 'Links from that website are not allowed.');
         const spotify = SPOTIFY_RE.exec(url);
         if (spotify) return this.#resolveSpotify(url, spotify[1].toLowerCase(), options);
 
@@ -172,5 +189,6 @@ class YtDlpPlugin extends ExtractorPlugin {
 }
 
 YtDlpPlugin.isAllowedUrl = isAllowedUrl;
+YtDlpPlugin.normalizeAllowedUrl = normalizeAllowedUrl;
 YtDlpPlugin.ALLOWED_HOSTS = ALLOWED_HOSTS;
 module.exports = YtDlpPlugin;
