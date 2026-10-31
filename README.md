@@ -10,8 +10,10 @@ A private Discord music bot for your own server. It plays music from YouTube, Yo
 
 | Command | What it does |
 |---|---|
-| `/play query [next]` | Play a song name, a link, or a playlist link. With `next:true` it goes to the front of the queue |
+| `/play query [next]` | Play by song title or any text (best YouTube match), a link, or a playlist link. With `next:true` it goes to the front of the queue |
 | `/search query` | Show 5 YouTube results and pick one with buttons |
+| `/radio query [songs]` | Type a song, artist or mood (e.g. `90s rock`). Plays the best match plus related songs, then keeps going |
+| `/autoplay [mode]` | Keep playing related songs when the queue runs out |
 | `/pause` `/resume` | Pause or resume |
 | `/skip` `/previous` | Next or previous song |
 | `/jump position` | Skip ahead to song # from `/queue` |

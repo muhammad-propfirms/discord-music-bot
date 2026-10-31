@@ -62,6 +62,30 @@ function thumbnailOf(info) {
     return undefined;
 }
 
+function normTitle(title) {
+    return String(title || '').toLowerCase()
+        .replace(/\(.*?\)|\[.*?\]/g, ' ')
+        .replace(/official|video|audio|lyrics?|hd|4k|remaster(ed)?/g, ' ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+function youtubeIdOf(url) {
+    if (!url) return null;
+    try {
+        const u = new URL(url);
+        const host = u.hostname.replace(/^(www|m|music)\./, '');
+        if (host === 'youtu.be') return u.pathname.slice(1, 12) || null;
+        if (host === 'youtube.com') {
+            const v = u.searchParams.get('v') || /^\/(?:shorts|live|embed)\/([\w-]{11})/.exec(u.pathname)?.[1];
+            return v && /^[\w-]{11}$/.test(v) ? v : null;
+        }
+    } catch {
+        // not a URL
+    }
+    return null;
+}
+
 function pageUrlOf(info) {
     if (info.webpage_url) return info.webpage_url;
     if (info.ie_key === 'Youtube' && info.id) return `https://www.youtube.com/watch?v=${info.id}`;
@@ -77,6 +101,8 @@ class YtDlpPlugin extends ExtractorPlugin {
     constructor(streamServer) {
         super();
         this.streamServer = streamServer;
+        /** song url -> { at, songs } */
+        this.relatedCache = new Map();
     }
 
     validate(url) {
@@ -144,6 +170,16 @@ class YtDlpPlugin extends ExtractorPlugin {
         return results.length ? this.toSong(results[0], options) : null;
     }
 
+    /**
+     * Best normal song for free text such as "90s rock" or "lofi chill": skips live
+     * streams and multi-hour compilations, which make bad radio starting points.
+     */
+    async findSong(query) {
+        const results = await this.search(query, 8);
+        const isSong = e => e && e.live_status !== 'is_live' && Number(e.duration) >= 60 && Number(e.duration) <= 15 * 60;
+        return results.find(isSong) || results.find(e => e && e.live_status !== 'is_live') || results[0] || null;
+    }
+
     /** Search YouTube and return raw yt-dlp entries (fast: no stream extraction). */
     async search(query, limit = 5) {
         const info = await ytdlp.getJson(`ytsearch${limit}:${query}`, ['--flat-playlist']);
@@ -155,8 +191,60 @@ class YtDlpPlugin extends ExtractorPlugin {
         return this.streamServer.urlFor(song.url);
     }
 
-    getRelatedSongs() {
-        return [];
+    /**
+     * Songs related to `song`, used by autoplay and /radio.
+     * YouTube songs use YouTube's own "Mix" for that video (the same list YouTube
+     * shows as "Mix - <song>"); other sites fall back to a YouTube search by title.
+     * @param {Song} song
+     * @param {number} [limit]
+     */
+    async getRelatedSongs(song, limit = 25) {
+        const cacheKey = `${song.url}|${limit}`;
+        const cached = this.relatedCache.get(cacheKey);
+        if (cached && Date.now() - cached.at < 30 * 60 * 1000) return cached.songs.map(s => this.#cloneSong(s));
+
+        let entries = [];
+        let id = youtubeIdOf(song.url);
+        try {
+            if (!id && song.name) {
+                // Not a YouTube song (e.g. SoundCloud): find it on YouTube, then use that video's Mix.
+                const match = await this.findSong([song.name, song.uploader?.name].filter(Boolean).join(' '));
+                id = match?.id && /^[\w-]{11}$/.test(match.id) ? match.id : null;
+            }
+            if (id) {
+                const mix = await ytdlp.getJson(`https://www.youtube.com/watch?v=${id}&list=RD${id}`,
+                    ['--flat-playlist', '--yes-playlist', '--playlist-items', `1:${limit + 1}`]);
+                entries = (mix.entries || []).filter(e => e && e.id && e.id !== id);
+            }
+            if (!entries.length && song.name) {
+                const query = [song.uploader?.name, 'similar songs'].filter(Boolean).join(' ');
+                entries = await this.search(query, Math.min(limit + 1, 10));
+            }
+            // Never "relate" a song to itself or to re-uploads with the same title.
+            const own = normTitle(song.name);
+            entries = entries.filter(e => e && e.id !== id && pageUrlOf(e) !== song.url
+                && !(own.length >= 4 && normTitle(e.title).includes(own)));
+        } catch (err) {
+            console.error('[RELATED] Could not get related songs:', err.message.split('\n')[0]);
+            return [];
+        }
+
+        const songs = entries
+            .filter(e => !e.live_status || e.live_status === 'not_live' || e.live_status === 'was_live')
+            .filter(e => !(Number(e.duration) > 15 * 60)) // skip hour-long mixes/compilations
+            .slice(0, limit)
+            .map(e => this.toSong(e, {}));
+        this.relatedCache.set(cacheKey, { at: Date.now(), songs });
+        if (this.relatedCache.size > 100) this.relatedCache.delete(this.relatedCache.keys().next().value);
+        return songs.map(s => this.#cloneSong(s));
+    }
+
+    #cloneSong(s) {
+        // DisTube mutates songs (member, metadata, stream), so hand out fresh copies.
+        return new Song({
+            plugin: this, source: s.source, playFromSource: true, id: s.id, name: s.name, url: s.url,
+            isLive: s.isLive, thumbnail: s.thumbnail, duration: s.duration, uploader: s.uploader,
+        }, {});
     }
 
     async #resolveSpotify(url, kind, options) {

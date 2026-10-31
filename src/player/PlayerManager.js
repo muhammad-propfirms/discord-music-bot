@@ -60,6 +60,7 @@ class PlayerManager {
 
         d.on('playSong', async (queue, song) => {
             this.#clearTimer(this.idleTimers, queue.id);
+            await this.ensureUpNext(queue);
             this.#prefetchNext(queue);
             await this.#deleteNowPlaying(queue.id);
             if (!queue.textChannel) return;
@@ -78,6 +79,11 @@ class PlayerManager {
         d.on('finish', async queue => {
             await this.#deleteNowPlaying(queue.id);
             queue.textChannel?.send({ embeds: [embed('info', '✅ Queue finished. Use `/play` to add more.')] }).catch(() => {});
+            this.#startIdleTimer(queue.id);
+        });
+
+        d.on('noRelated', async queue => {
+            queue.textChannel?.send({ embeds: [embed('info', '♾️ Autoplay couldn\'t find a related song, so the music stopped. Use `/play` or `/radio` to start again.')] }).catch(() => {});
             this.#startIdleTimer(queue.id);
         });
 
@@ -118,10 +124,27 @@ class PlayerManager {
                 { name: 'Requested by', value: song.member ? `${song.member}` : 'Unknown', inline: true },
                 { name: 'Up next', value: queue.songs[1] ? truncate(queue.songs[1].name, 100) : 'Nothing', inline: true },
             )
-            .setFooter({ text: `Volume ${queue.volume}% • Loop: ${REPEAT_LABEL[queue.repeatMode]} • ${queue.songs.length} in queue` });
+            .setFooter({ text: `Volume ${queue.volume}% • Loop: ${REPEAT_LABEL[queue.repeatMode]} • Autoplay: ${queue.autoplay ? 'On' : 'Off'} • ${queue.songs.length} in queue` });
         if (song.url) e.setURL(song.url);
         if (song.thumbnail) e.setThumbnail(song.thumbnail);
         return e;
+    }
+
+    /**
+     * With autoplay on, add the next related song as soon as the last queued song
+     * starts, so it can be prefetched and there is no silence between songs.
+     */
+    async ensureUpNext(queue) {
+        if (!queue.autoplay || queue.songs.length !== 1 || queue.repeatMode !== RepeatMode.DISABLED) return;
+        try {
+            await queue.addRelatedSong();
+        } catch {
+            // DisTube will try again (and emit "noRelated") when the song ends.
+        }
+    }
+
+    prefetchNext(queue) {
+        this.#prefetchNext(queue);
     }
 
     #prefetchNext(queue) {
