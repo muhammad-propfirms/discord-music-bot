@@ -7,8 +7,13 @@
  * when ffmpeg fetches its media URLs directly, so instead we give ffmpeg a
  * local URL, and this server pipes yt-dlp's own download into the response.
  *
- * It also prefetches the next song in the queue into memory so there is
- * almost no silence between songs.
+ * - The next song in the queue is downloaded in the background (at low CPU
+ *   priority) while the current one plays, so the next song starts at once.
+ *   If that download is still starting when it's needed, we wait for it rather
+ *   than starting over (on a slow server, starting over costs minutes).
+ * - If YouTube refuses a song, the same song is played from SoundCloud.
+ * - If no audio arrives within STREAM_START_TIMEOUT, we give up loudly instead
+ *   of leaving the bot sitting silently in the channel.
  */
 
 const http = require('node:http');
@@ -19,7 +24,6 @@ const config = require('../config/config');
 
 const PREFETCH_MAX_BYTES = 64 * 1024 * 1024; // ~ 1 hour of opus audio
 const PREFETCH_TTL_MS = 30 * 60 * 1000;
-const YOUTUBE_BLOCK_MEMORY_MS = 10 * 60 * 1000;
 const BLOCKED_RE = /confirm you.?re not a bot|Sign in to confirm|HTTP Error 403|Requested format is not available/i;
 
 function isYouTube(url) {
@@ -30,17 +34,79 @@ function isYouTube(url) {
     }
 }
 
+/**
+ * One running yt-dlp download. Audio is kept in memory until a listener
+ * (ffmpeg) attaches; after that it is forwarded with backpressure.
+ */
+class Job extends EventEmitter {
+    constructor(target, isFallback, background) {
+        super();
+        this.target = target;
+        this.isFallback = isFallback;
+        this.startedAt = Date.now();
+        this.chunks = [];
+        this.buffered = 0;
+        this.size = 0;
+        this.stderr = '';
+        this.done = false;
+        this.code = null;
+        this.timedOut = false;
+        this.res = null;
+        this.proc = ytdlp.spawnAudio(target, { background });
+
+        this.proc.stdout.on('data', chunk => {
+            this.size += chunk.length;
+            if (this.res) {
+                if (!this.res.write(chunk) && !this.waitingForDrain) {
+                    this.waitingForDrain = true;
+                    this.proc.stdout.pause();
+                    this.res.once('drain', () => {
+                        this.waitingForDrain = false;
+                        this.proc.stdout.resume();
+                    });
+                }
+            } else {
+                this.chunks.push(chunk);
+                this.buffered += chunk.length;
+                if (this.buffered > PREFETCH_MAX_BYTES) this.kill();
+            }
+            this.emit('data');
+        });
+        this.proc.stderr.on('data', d => { this.stderr = (this.stderr + d).slice(-4000); });
+        this.proc.on('error', err => { this.stderr += `\n${err.message}`; });
+        this.proc.on('close', code => {
+            this.done = true;
+            this.code = code;
+            this.emit('close', code);
+        });
+    }
+
+    /** Failed without producing any audio. */
+    get failed() {
+        return this.done && this.size === 0;
+    }
+
+    attach(res) {
+        this.res = res;
+        for (const chunk of this.chunks) res.write(chunk);
+        this.chunks = [];
+        this.buffered = 0;
+    }
+
+    kill() {
+        if (!this.done) this.proc.kill();
+    }
+}
+
 class StreamServer extends EventEmitter {
     constructor() {
         super();
         this.key = crypto.randomBytes(16).toString('hex');
         this.port = null;
-        /** @type {Map<string, {proc, chunks: Buffer[], size: number, done: boolean, failed: boolean, listeners: Set<Function>, timer}>} */
+        /** song url -> { job, timer } */
         this.prefetches = new Map();
         /** song url -> search text used for the SoundCloud fallback */
         this.fallbackQueries = new Map();
-        /** While YouTube is known to block this server, go straight to the fallback. */
-        this.youtubeBlockedUntil = 0;
         this.server = http.createServer((req, res) => this.#handle(req, res));
     }
 
@@ -63,8 +129,7 @@ class StreamServer extends EventEmitter {
         let url = `http://127.0.0.1:${this.port}/audio?key=${this.key}&u=${encodeURIComponent(songUrl)}`;
         if (fallbackQuery) {
             url += `&q=${encodeURIComponent(fallbackQuery)}`;
-            this.fallbackQueries.set(songUrl, fallbackQuery);
-            if (this.fallbackQueries.size > 500) this.fallbackQueries.delete(this.fallbackQueries.keys().next().value);
+            this.setFallbackQuery(songUrl, fallbackQuery);
         }
         return url;
     }
@@ -76,17 +141,9 @@ class StreamServer extends EventEmitter {
         if (this.fallbackQueries.size > 500) this.fallbackQueries.delete(this.fallbackQueries.keys().next().value);
     }
 
-    #youtubeBlocked() {
-        return Date.now() < this.youtubeBlockedUntil || ytdlp.youtubeStatus() === 'blocked';
-    }
-
-    #markBlocked() {
-        this.youtubeBlockedUntil = Date.now() + YOUTUBE_BLOCK_MEMORY_MS;
-    }
-
     /** What yt-dlp should download for this song right now. */
     #target(songUrl, query) {
-        if (config.soundcloudFallback && query && isYouTube(songUrl) && this.#youtubeBlocked()) {
+        if (config.soundcloudFallback && query && isYouTube(songUrl) && ytdlp.isYouTubeBlocked()) {
             return { target: `scsearch1:${query}`, isFallback: true };
         }
         return { target: songUrl, isFallback: false };
@@ -95,32 +152,16 @@ class StreamServer extends EventEmitter {
     /** Start downloading a song in the background so it is ready when needed. */
     prefetch(songUrl) {
         if (!songUrl || this.prefetches.has(songUrl)) return;
-        // Only keep one prefetch at a time.
-        for (const url of this.prefetches.keys()) this.#dropPrefetch(url);
+        // Only one background download at a time: the CPU is precious.
+        for (const url of [...this.prefetches.keys()]) this.#dropPrefetch(url);
 
         const { target, isFallback } = this.#target(songUrl, this.fallbackQueries.get(songUrl));
-        const proc = ytdlp.spawnAudio(target);
-        const entry = { proc, isFallback, chunks: [], size: 0, done: false, failed: false, timer: null, onData: null };
-        entry.timer = setTimeout(() => this.#dropPrefetch(songUrl), PREFETCH_TTL_MS);
-        entry.timer.unref();
-        this.prefetches.set(songUrl, entry);
-
-        // Buffering in memory only happens before handoff, and is capped.
-        entry.onData = chunk => {
-            entry.chunks.push(chunk);
-            entry.size += chunk.length;
-            if (entry.size > PREFETCH_MAX_BYTES) this.#dropPrefetch(songUrl);
-        };
-        proc.stdout.on('data', entry.onData);
-        let stderr = '';
-        proc.stderr.on('data', d => { stderr += d; });
-        proc.on('error', () => { entry.failed = true; });
-        proc.on('close', code => {
-            entry.done = true;
-            if (code !== 0 && entry.size === 0) {
-                entry.failed = true;
-                if (!isFallback && isYouTube(songUrl) && BLOCKED_RE.test(stderr)) this.#markBlocked();
-            }
+        const job = new Job(target, isFallback, true);
+        const timer = setTimeout(() => this.#dropPrefetch(songUrl), PREFETCH_TTL_MS);
+        timer.unref();
+        this.prefetches.set(songUrl, { job, timer });
+        job.once('close', () => {
+            if (job.failed && !isFallback && isYouTube(songUrl) && BLOCKED_RE.test(job.stderr)) ytdlp.markYouTubeBlocked();
         });
     }
 
@@ -129,10 +170,7 @@ class StreamServer extends EventEmitter {
         if (!entry) return;
         this.prefetches.delete(songUrl);
         clearTimeout(entry.timer);
-        entry.proc.stdout.off('data', entry.onData);
-        entry.chunks = [];
-        entry.failed = true;
-        if (!entry.done) entry.proc.kill();
+        entry.job.kill();
     }
 
     #handle(req, res) {
@@ -155,91 +193,94 @@ class StreamServer extends EventEmitter {
             return;
         }
 
+        // ffmpeg disconnects on skip/stop; late writes must not crash the bot.
+        res.on('error', () => {});
+        req.on('error', () => {});
         res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' });
 
+        // Take over the background download if there is a usable one (even if it is still starting).
+        let job = null;
         const entry = this.prefetches.get(songUrl);
-        this.prefetches.delete(songUrl);
-        if (entry) clearTimeout(entry.timer);
-        // Use the prefetch only if it is healthy and already delivering audio.
-        if (entry && !entry.failed && entry.size > 0) {
-            if (entry.isFallback) this.emit('fallback', songUrl);
-            this.#serveFromPrefetch(entry, req, res);
-            return;
+        if (entry) {
+            this.prefetches.delete(songUrl);
+            clearTimeout(entry.timer);
+            if (entry.job.failed) entry.job.kill();
+            else job = entry.job;
         }
-        if (entry && !entry.done) entry.proc.kill();
-        this.#serveLive(songUrl, query, req, res);
+        this.#serve(songUrl, query, job, req, res);
     }
 
     /**
-     * Pipe yt-dlp's download into the response. If YouTube refuses (bot check /
-     * 403) before any audio was sent, retry the same song from SoundCloud.
+     * Feed one song to ffmpeg. If YouTube refuses (bot check / 403) or nothing
+     * arrives in time before any audio was sent, retry the same song from SoundCloud.
      */
-    #serveLive(songUrl, query, req, res) {
+    #serve(songUrl, query, prefetched, req, res) {
         let closed = false;
         let current = null;
+        let watchdog = null;
+        const timeoutMs = config.streamStartTimeout * 1000;
 
-        const run = (target, isFallback) => {
-            const proc = ytdlp.spawnAudio(target);
-            current = proc;
-            let stderr = '';
-            let bytes = 0;
-            proc.stderr.on('data', d => { stderr += d; });
-            proc.stdout.on('data', d => { bytes += d.length; });
-            proc.stdout.pipe(res, { end: false });
-            proc.on('error', err => {
-                console.error('[STREAM] Could not start yt-dlp:', err.message);
-                res.destroy();
-            });
-            proc.on('close', code => {
-                if (closed) return; // the listener went away (skip/stop): nothing to report
-                if (code !== 0 && bytes === 0) {
-                    const blocked = !isFallback && isYouTube(songUrl) && BLOCKED_RE.test(stderr);
-                    if (blocked) this.#markBlocked();
-                    if (blocked && config.soundcloudFallback && query) {
-                        console.warn(`[STREAM] YouTube blocked ${songUrl}; trying SoundCloud for "${query}"`);
-                        this.emit('fallback', songUrl);
-                        run(`scsearch1:${query}`, true);
-                        return;
+        const start = job => {
+            current = job;
+            if (job.isFallback) this.emit('fallback', songUrl);
+            job.attach(res);
+            const onAudio = () => {
+                clearTimeout(watchdog);
+                if (!job.isFallback && isYouTube(songUrl)) ytdlp.markYouTubeOk();
+                this.emit('started', songUrl);
+            };
+            if (job.size > 0) setImmediate(onAudio); // prefetched audio is already here
+            else job.once('data', onAudio);
+            if (job.size === 0 && !job.done && timeoutMs > 0) {
+                watchdog = setTimeout(() => {
+                    if (current === job && job.size === 0 && !job.done) {
+                        console.warn(`[STREAM] No audio after ${config.streamStartTimeout}s for ${job.target}; giving up on it.`);
+                        job.timedOut = true;
+                        job.kill();
                     }
-                    console.error(`[STREAM] yt-dlp exited with code ${code} for ${target}\n${stderr.trim().slice(-800)}`);
-                    this.emit('streamError', songUrl, new Error(isFallback
-                        ? `YouTube blocked this song and no SoundCloud version could be played. ${stderr.trim().slice(-300)}`
-                        : stderr.trim() || `yt-dlp exited with code ${code}`));
-                } else if (code !== 0) {
-                    console.error(`[STREAM] yt-dlp exited with code ${code} after ${bytes} bytes for ${target}`);
+                }, timeoutMs);
+            }
+            const onClose = code => {
+                clearTimeout(watchdog);
+                if (closed || current !== job) return; // listener left (skip/stop) or replaced
+                if (job.size > 0) {
+                    if (code !== 0) console.error(`[STREAM] yt-dlp exited with code ${code} after ${job.size} bytes for ${job.target}`);
+                    res.end();
+                    return;
                 }
+                const youtubeRefused = !job.isFallback && isYouTube(songUrl);
+                const blocked = youtubeRefused && BLOCKED_RE.test(job.stderr);
+                if (blocked) ytdlp.markYouTubeBlocked();
+                if (youtubeRefused && (blocked || job.timedOut) && config.soundcloudFallback && query) {
+                    console.warn(`[STREAM] YouTube ${blocked ? 'blocked' : 'timed out on'} ${songUrl}; trying SoundCloud for "${query}"`);
+                    start(new Job(`scsearch1:${query}`, true, false));
+                    return;
+                }
+                const reason = job.timedOut
+                    ? `No audio arrived within ${config.streamStartTimeout} seconds (the server may be overloaded).`
+                    : job.isFallback
+                        ? `YouTube blocked this song and no SoundCloud version could be played. ${job.stderr.trim().slice(-300)}`
+                        : job.stderr.trim() || `yt-dlp exited with code ${code}`;
+                console.error(`[STREAM] Failed: ${job.target}\n${reason.slice(-800)}`);
+                this.emit('streamError', songUrl, new Error(reason));
                 res.end();
-            });
+            };
+            if (job.done) onClose(job.code);
+            else job.once('close', onClose);
         };
 
-        const first = this.#target(songUrl, query);
-        if (first.isFallback) this.emit('fallback', songUrl);
-        run(first.target, first.isFallback);
+        if (prefetched) {
+            start(prefetched);
+        } else {
+            const { target, isFallback } = this.#target(songUrl, query);
+            start(new Job(target, isFallback, false));
+        }
 
         const cleanup = () => {
             closed = true;
-            if (current && current.exitCode === null) current.kill();
+            clearTimeout(watchdog);
+            current?.kill();
         };
-        req.on('close', cleanup);
-        res.on('close', cleanup);
-    }
-
-    #serveFromPrefetch(entry, req, res) {
-        const { proc } = entry;
-        // Stop buffering into memory, send what was prefetched (at most PREFETCH_MAX_BYTES),
-        // then pipe the rest so normal backpressure applies and memory stays bounded.
-        proc.stdout.pause();
-        proc.stdout.off('data', entry.onData);
-        const buffered = entry.chunks;
-        entry.chunks = [];
-        for (const chunk of buffered) res.write(chunk);
-
-        if (entry.done || proc.stdout.readableEnded) {
-            res.end();
-        } else {
-            proc.stdout.pipe(res);
-        }
-        const cleanup = () => { if (proc.exitCode === null) proc.kill(); };
         req.on('close', cleanup);
         res.on('close', cleanup);
     }

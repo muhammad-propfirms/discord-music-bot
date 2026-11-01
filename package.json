@@ -1,6 +1,6 @@
 {
   "name": "discord-music-bot",
-  "version": "5.1.0",
+  "version": "5.2.0",
   "private": true,
   "description": "A self-hosted Discord music bot for a private server, powered by DisTube, yt-dlp and discord.js.",
   "main": "index.js",

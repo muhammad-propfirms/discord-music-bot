@@ -34,4 +34,6 @@ services:
         value: "true"
       - key: SOUNDCLOUD_FALLBACK   # play from SoundCloud if YouTube blocks Render
         value: "true"
+      - key: STREAM_START_TIMEOUT  # seconds to wait for audio before trying SoundCloud / giving up
+        value: "150"
       # Do NOT add PORT: Render sets it automatically (10000).

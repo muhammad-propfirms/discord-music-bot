@@ -34,6 +34,17 @@ function binaryPath() {
     return config.ytdlpPath || LOCAL_BIN;
 }
 
+/**
+ * Background jobs (prefetching the next song, self-update, the startup test) run
+ * at low CPU priority via `nice`, so the song that is playing right now always
+ * gets the CPU first. This matters a lot on tiny servers (Render free = 0.1 CPU).
+ */
+const NICE = IS_WIN ? null : ['/usr/bin/nice', '/bin/nice'].find(p => fs.existsSync(p)) || null;
+function command(args, background) {
+    if (background && NICE) return [NICE, ['-n', '15', binaryPath(), ...args]];
+    return [binaryPath(), args];
+}
+
 async function download() {
     const asset = releaseAssetName();
     const url = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset}`;
@@ -58,7 +69,8 @@ function version() {
 
 function selfUpdate() {
     return new Promise(resolve => {
-        execFile(binaryPath(), ['-U'], { timeout: 120_000, windowsHide: true }, (err, stdout, stderr) => {
+        const [cmd, args] = command(['-U'], true);
+        execFile(cmd, args, { timeout: 300_000, windowsHide: true }, (err, stdout, stderr) => {
             const out = `${stdout}${stderr}`.trim().split(/\r?\n/).pop();
             if (err) console.warn('[yt-dlp] Self-update failed (continuing with current version):', out);
             else console.log('[yt-dlp]', out);
@@ -77,14 +89,16 @@ async function ensure() {
         console.log(`[yt-dlp] Using ${config.ytdlpPath} (version ${v})`);
         return v;
     }
+    let fresh = false;
     if (!fs.existsSync(LOCAL_BIN)) {
-        await download();
-    } else if (config.ytdlpAutoUpdate) {
-        await selfUpdate();
+        await download(); // always the latest release
+        fresh = true;
     }
     const v = await version();
     if (!v) throw new Error(`yt-dlp at ${LOCAL_BIN} could not be run.`);
     console.log(`[yt-dlp] Ready (version ${v})`);
+    // An older copy is updated in the background instead of delaying startup.
+    if (!fresh && config.ytdlpAutoUpdate) setTimeout(() => selfUpdate(), 60_000).unref();
     return v;
 }
 
@@ -189,22 +203,47 @@ function logCookieStatus() {
     for (const p of r.problems) console.warn(`[COOKIES] ${p}`);
 }
 
+/*
+ * Whether YouTube currently lets this server download audio. Updated by real
+ * playback (StreamServer) and by the startup test. A "blocked" result is only
+ * trusted for 10 minutes, then YouTube is tried again.
+ */
+const BLOCK_MEMORY_MS = 10 * 60 * 1000;
 let ytStatus = 'unknown';
+let blockedUntil = 0;
+
 function youtubeStatus() {
+    if (ytStatus === 'blocked' && Date.now() >= blockedUntil) return 'unknown';
     return ytStatus;
+}
+function isYouTubeBlocked() {
+    return Date.now() < blockedUntil;
+}
+function markYouTubeBlocked() {
+    if (ytStatus !== 'blocked') console.warn('[YOUTUBE] YouTube is refusing downloads on this server; using SoundCloud for the next 10 minutes.');
+    ytStatus = 'blocked';
+    blockedUntil = Date.now() + BLOCK_MEMORY_MS;
+}
+function markYouTubeOk() {
+    if (ytStatus !== 'ok') console.log('[YOUTUBE] YouTube playback is working.');
+    ytStatus = 'ok';
+    blockedUntil = 0;
 }
 
 /** Try to get a playable audio stream for a known video and log the result. */
 async function testYouTube() {
+    // Real playback already answered the question: don't spend CPU on a test.
+    if (ytStatus !== 'unknown') return;
     ytStatus = 'testing';
     try {
-        const info = await getJson('https://www.youtube.com/watch?v=dQw4w9WgXcQ', ['--no-playlist', '-f', 'ba/ba*/b']);
+        const info = await getJson('https://www.youtube.com/watch?v=dQw4w9WgXcQ', ['--no-playlist', '-f', 'ba/ba*/b'], { background: true });
         if (!info.url && !info.requested_downloads?.length) throw new Error('no audio stream returned');
-        ytStatus = 'ok';
+        if (ytStatus === 'testing') ytStatus = 'ok';
         console.log('[YOUTUBE] Test passed: this server can play YouTube.');
     } catch (err) {
         const blocked = /confirm you.?re not a bot|Sign in to confirm/i.test(err.message);
-        ytStatus = blocked ? 'blocked' : 'error';
+        if (blocked) markYouTubeBlocked();
+        else if (ytStatus === 'testing') ytStatus = 'error';
         if (blocked) {
             console.warn('[YOUTUBE] Test FAILED: YouTube is blocking this server ("Sign in to confirm you\'re not a bot").');
             console.warn(cookieReport.source
@@ -236,10 +275,11 @@ function baseArgs() {
  * @param {string} target URL or "ytsearchN:query"
  * @param {string[]} extra extra flags
  */
-function getJson(target, extra = []) {
+function getJson(target, extra = [], { background = false } = {}) {
     const args = [...baseArgs(), '--dump-single-json', '--skip-download', ...extra, '--', target];
     return new Promise((resolve, reject) => {
-        execFile(binaryPath(), args, { maxBuffer: 256 * 1024 * 1024, timeout: 120_000, windowsHide: true },
+        const [cmd, cmdArgs] = command(args, background);
+        execFile(cmd, cmdArgs, { maxBuffer: 256 * 1024 * 1024, timeout: 300_000, windowsHide: true },
             (err, stdout, stderr) => {
                 if (err) {
                     const msg = (stderr || err.message).trim().split(/\r?\n/).filter(l => l.startsWith('ERROR')).join('\n')
@@ -260,9 +300,10 @@ function getJson(target, extra = []) {
  * yt-dlp does the download itself, which avoids the 403 errors YouTube now
  * returns when ffmpeg requests googlevideo URLs directly.
  */
-function spawnAudio(url) {
+function spawnAudio(url, { background = false } = {}) {
     const args = [...baseArgs(), '--quiet', '--no-playlist', '-f', 'ba/ba*/b', '-o', '-', '--', url];
-    return spawn(binaryPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const [cmd, cmdArgs] = command(args, background);
+    return spawn(cmd, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
 }
 
-module.exports = { ensure, getJson, spawnAudio, version, binaryPath, logCookieStatus, testYouTube, youtubeStatus, repairCookies };
+module.exports = { ensure, getJson, spawnAudio, version, binaryPath, logCookieStatus, testYouTube, youtubeStatus, isYouTubeBlocked, markYouTubeBlocked, markYouTubeOk, repairCookies };

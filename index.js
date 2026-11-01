@@ -91,7 +91,8 @@ async function main() {
     await client.login(config.token);
 
     // Check in the background whether this server can actually play YouTube.
-    ytdlp.testYouTube().catch(() => {});
+    // Wait until startup is over so the test never competes with the first song for CPU.
+    setTimeout(() => ytdlp.testYouTube().catch(() => {}), 120_000).unref();
 }
 
 main().catch(error => {

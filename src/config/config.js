@@ -54,6 +54,9 @@ module.exports = {
     // If YouTube blocks a song on this server, play the same song from SoundCloud instead.
     soundcloudFallback: process.env.SOUNDCLOUD_FALLBACK !== 'false',
 
+    // Give up on a song (or try SoundCloud) if no audio arrived after this many seconds. 0 = wait forever.
+    streamStartTimeout: Math.max(int(process.env.STREAM_START_TIMEOUT, 150), 0),
+
     // Health-check web server (needed on Render/Railway). See resolvePort().
     ...resolvePort(),
 };

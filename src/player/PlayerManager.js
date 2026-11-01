@@ -47,6 +47,10 @@ class PlayerManager {
         this.recentStreamErrors = new Map();
         /** guildId -> time of the last "playing from SoundCloud" notice */
         this.fallbackNotices = new Map();
+        /** guildIds whose current song has started producing audio */
+        this.audioStarted = new Set();
+        /** guildId -> { timer, message } for the "still loading" notice */
+        this.loadingNotices = new Map();
 
         this.#registerEvents();
     }
@@ -60,27 +64,48 @@ class PlayerManager {
 
         d.on('initQueue', queue => {
             queue.setVolume(config.defaultVolume);
+            // By default @discordjs/voice ENDS a song after only 5 late audio frames (100 ms).
+            // On a slow server that silently skips songs. Allow up to 30 s of hiccups instead.
+            const player = queue.voice?.audioPlayer;
+            if (player?.behaviors) player.behaviors.maxMissedFrames = 50 * 30;
         });
 
         d.on('playSong', async (queue, song) => {
             this.#clearTimer(this.idleTimers, queue.id);
-            await this.ensureUpNext(queue);
-            this.#prefetchNext(queue);
+            this.audioStarted.delete(queue.id);
+            this.#watchLoading(queue, song);
             await this.#deleteNowPlaying(queue.id);
-            if (!queue.textChannel) return;
-            try {
-                const msg = await queue.textChannel.send({ embeds: [this.nowPlayingEmbed(queue, song)] });
-                this.nowPlayingMessages.set(queue.id, msg);
-            } catch (err) {
-                console.error('[PLAYER] Could not send now-playing message:', err.message);
+            if (queue.textChannel) {
+                try {
+                    const msg = await queue.textChannel.send({ embeds: [this.nowPlayingEmbed(queue, song)] });
+                    this.nowPlayingMessages.set(queue.id, msg);
+                } catch (err) {
+                    console.error('[PLAYER] Could not send now-playing message:', err.message);
+                }
             }
+            // The next song is downloaded once this one is audible (see 'started' below).
+            // With autoplay on, line up a related song now so it can be prefetched too.
+            await this.ensureUpNext(queue);
+            if (this.audioStarted.has(queue.id)) this.#prefetchNext(queue);
         });
 
         // Keep prefetch pointed at whatever is next if the queue changes.
-        d.on('addSong', queue => this.#prefetchNext(queue));
-        d.on('addList', queue => this.#prefetchNext(queue));
+        d.on('addSong', queue => { if (this.audioStarted.has(queue.id)) this.#prefetchNext(queue); });
+        d.on('addList', queue => { if (this.audioStarted.has(queue.id)) this.#prefetchNext(queue); });
+
+        // Audio for the current song has started flowing: now (and only now) start
+        // downloading the next one, so the two never fight over a small CPU.
+        this.streamServer.on('started', songUrl => {
+            for (const queue of this.#queuesPlaying(songUrl)) {
+                this.audioStarted.add(queue.id);
+                this.#clearLoadingNotice(queue.id);
+                this.#prefetchNext(queue);
+            }
+        });
 
         d.on('finish', async queue => {
+            this.#clearLoadingNotice(queue.id);
+            this.audioStarted.delete(queue.id);
             await this.#deleteNowPlaying(queue.id);
             queue.textChannel?.send({ embeds: [embed('info', '✅ Queue finished. Use `/play` to add more.')] }).catch(() => {});
             this.#startIdleTimer(queue.id);
@@ -108,6 +133,7 @@ class PlayerManager {
             this.recentStreamErrors.set(songUrl, Date.now());
             if (this.recentStreamErrors.size > 200) this.recentStreamErrors.delete(this.recentStreamErrors.keys().next().value);
             for (const queue of this.#queuesPlaying(songUrl)) {
+                this.#clearLoadingNotice(queue.id);
                 queue.textChannel?.send({
                     embeds: [embed('error', `❌ Could not stream **${truncate(queue.songs[0].name, 80)}**: ${friendlyError(error)}`)],
                 }).catch(() => {});
@@ -204,9 +230,39 @@ class PlayerManager {
         }, config.leaveWhenIdleAfter * 1000));
     }
 
+    /** If a song takes a while to start, tell people instead of sitting there silently. */
+    #watchLoading(queue, song) {
+        this.#clearLoadingNotice(queue.id);
+        const timer = setTimeout(async () => {
+            if (this.audioStarted.has(queue.id) || queue.songs[0] !== song || !queue.textChannel) return;
+            try {
+                const message = await queue.textChannel.send({
+                    embeds: [embed('info', `⏳ Still loading **${truncate(song.name, 80)}**… The server is slow right now, it will start in a moment.`)],
+                });
+                const notice = this.loadingNotices.get(queue.id);
+                if (notice && notice.timer === timer && !this.audioStarted.has(queue.id)) notice.message = message;
+                else message.delete().catch(() => {});
+            } catch {
+                // ignore
+            }
+        }, 20_000);
+        timer.unref();
+        this.loadingNotices.set(queue.id, { timer, message: null });
+    }
+
+    #clearLoadingNotice(guildId) {
+        const notice = this.loadingNotices.get(guildId);
+        if (!notice) return;
+        this.loadingNotices.delete(guildId);
+        clearTimeout(notice.timer);
+        notice.message?.delete().catch(() => {});
+    }
+
     #cleanup(guildId) {
         this.#clearTimer(this.aloneTimers, guildId);
         this.#clearTimer(this.idleTimers, guildId);
+        this.#clearLoadingNotice(guildId);
+        this.audioStarted.delete(guildId);
         this.#deleteNowPlaying(guildId);
     }
 

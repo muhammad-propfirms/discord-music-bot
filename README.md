@@ -54,6 +54,17 @@ This repo includes a [`render.yaml`](render.yaml) Blueprint. In Render, choose *
 
 > **Do not add a `PORT` variable on Render.** Render sets it (10000) itself. If YouTube blocks Render, songs play from SoundCloud automatically until you add fresh cookies, and the logs show `[COOKIES]` and `[YOUTUBE]` lines that explain what is going on.
 
+## Performance on small servers
+
+Render's free plan gives the bot only 0.1 of a CPU core. To keep playback snappy there:
+
+- Searches and YouTube link lookups use YouTube's web API directly (about 0.1 s of CPU) instead of starting yt-dlp.
+- yt-dlp only runs to download audio. The next song downloads in the background at low priority, starting once the current song is audible, so it begins right when the previous one ends.
+- A short CPU hiccup no longer ends the song. The voice library's default is to stop after 100 ms of late audio; the bot allows 30 s.
+- If a song's audio hasn't started after `STREAM_START_TIMEOUT` seconds (default 150), the bot tries SoundCloud or reports an error instead of sitting silently. After 20 s it posts a "still loading" note.
+
+Even so, YouTube downloads need real CPU. For instant playback, use Render's Starter plan or run the bot on a home PC.
+
 ## Settings (`.env`)
 
 See [`.env.example`](.env.example). The main ones:

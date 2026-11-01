@@ -2,6 +2,7 @@
 
 const { ExtractorPlugin, Playlist, Song, DisTubeError } = require('distube');
 const ytdlp = require('./ytdlp');
+const youtube = require('./youtube');
 const config = require('../config/config');
 
 const SPOTIFY_RE = /^https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?(track|album|playlist|artist)\//i;
@@ -136,6 +137,18 @@ class YtDlpPlugin extends ExtractorPlugin {
         const spotify = SPOTIFY_RE.exec(url);
         if (spotify) return this.#resolveSpotify(url, spotify[1].toLowerCase(), options);
 
+        // Single YouTube video (also "watch?v=..&list=.." links): read the details over HTTP,
+        // which is far cheaper than starting yt-dlp. yt-dlp remains the fallback.
+        const videoId = youtubeIdOf(url);
+        const isPlaylistPage = /\/playlist\b/.test(new URL(url).pathname);
+        if (videoId && !isPlaylistPage) {
+            try {
+                return this.toSong(await youtube.video(videoId), options);
+            } catch (err) {
+                console.warn(`[RESOLVE] Fast lookup failed for ${videoId} (${err.message}); using yt-dlp.`);
+            }
+        }
+
         let info;
         try {
             info = await ytdlp.getJson(url, [
@@ -180,8 +193,17 @@ class YtDlpPlugin extends ExtractorPlugin {
         return results.find(isSong) || results.find(e => e && e.live_status !== 'is_live') || results[0] || null;
     }
 
-    /** Search YouTube and return raw yt-dlp entries (fast: no stream extraction). */
+    /**
+     * Search YouTube. Uses the fast HTTP API first (about 1 second even on a tiny
+     * server); falls back to yt-dlp if that fails or finds nothing.
+     */
     async search(query, limit = 5) {
+        try {
+            const results = await youtube.search(query, limit);
+            if (results.length) return results;
+        } catch (err) {
+            console.warn(`[SEARCH] Fast search failed (${err.message}); using yt-dlp.`);
+        }
         const info = await ytdlp.getJson(`ytsearch${limit}:${query}`, ['--flat-playlist']);
         return (info.entries || []).filter(Boolean);
     }
