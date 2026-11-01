@@ -4,6 +4,8 @@ A private Discord music bot for your own server. It plays music from YouTube, Yo
 
 **📄 Full step-by-step guide (PDF): [`docs/Music-Bot-Setup-Guide.pdf`](docs/Music-Bot-Setup-Guide.pdf)**
 
+**🛠️ Deploy stuck on Render or YouTube blocked? [`docs/Render-Fix-Steps.pdf`](docs/Render-Fix-Steps.pdf)**
+
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/muhammad-propfirms/discord-music-bot)
 
 ## Commands
@@ -49,6 +51,8 @@ You don't install ffmpeg or yt-dlp yourself. ffmpeg comes bundled through `ffmpe
 ## Deploy on Render
 
 This repo includes a [`render.yaml`](render.yaml) Blueprint. In Render, choose **New → Blueprint** and pick this repo. Render then creates the service, sets the build and start commands and the health check, and asks you for `TOKEN` (required) plus `GUILD_ID` and `ALLOWED_ROLE_IDS` (both optional). The PDF guide covers this in detail, along with keeping a free instance awake and adding YouTube cookies if Render's IP gets blocked.
+
+> **Do not add a `PORT` variable on Render.** Render sets it (10000) itself. If YouTube blocks Render, songs play from SoundCloud automatically until you add fresh cookies, and the logs show `[COOKIES]` and `[YOUTUBE]` lines that explain what is going on.
 
 ## Settings (`.env`)
 

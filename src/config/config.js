@@ -51,6 +51,25 @@ module.exports = {
     // ffmpeg: use FFMPEG_PATH if set, otherwise the copy bundled by ffmpeg-static.
     ffmpegPath: (process.env.FFMPEG_PATH || '').trim() || bundledFfmpeg(),
 
-    // Optional health-check web server (for hosts like Render/Railway). Off unless PORT is set.
-    port: int(process.env.PORT, 0),
+    // If YouTube blocks a song on this server, play the same song from SoundCloud instead.
+    soundcloudFallback: process.env.SOUNDCLOUD_FALLBACK !== 'false',
+
+    // Health-check web server (needed on Render/Railway). See resolvePort().
+    ...resolvePort(),
 };
+
+/**
+ * Render sets PORT itself (10000). If someone overrides it with a wrong value,
+ * the web server would not start and Render waits forever ("No open ports
+ * detected"), so on Render we always fall back to 10000.
+ */
+function resolvePort() {
+    const raw = (process.env.PORT ?? '').trim();
+    const onRender = Boolean(process.env.RENDER);
+    if (/^\d{2,5}$/.test(raw) && Number(raw) > 0 && Number(raw) < 65536) return { port: Number(raw), portWarning: null };
+    const portWarning = raw
+        ? `PORT is set to "${raw.slice(0, 40)}", which is not a valid port number.`
+          + (onRender ? ' Using 10000 instead. Delete the PORT variable in Render > Environment: Render sets it automatically.' : ' The health-check server is disabled.')
+        : null;
+    return { port: onRender ? 10000 : 0, portWarning };
+}

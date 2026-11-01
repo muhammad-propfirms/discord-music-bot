@@ -95,24 +95,125 @@ async function ensure() {
  * YTDLP_COOKIES_BASE64) for hosts without file support.
  */
 let cookiesCopy;
+let cookieReport = { source: null, problems: [], youtubeCookies: 0, loggedIn: false };
+
+/**
+ * Fix the usual copy/paste damage so yt-dlp can read the file:
+ * tabs turned into spaces, Windows line endings, a missing header line.
+ */
+function repairCookies(text) {
+    const problems = [];
+    const trimmed = text.replace(/^﻿/, '').trim();
+    if (/^[[{]/.test(trimmed)) {
+        problems.push('The cookies are in JSON format. Export them in "Netscape" / cookies.txt format instead.');
+        return { text: null, problems, youtube: 0, loggedIn: false };
+    }
+    const out = ['# Netscape HTTP Cookie File'];
+    let youtube = 0;
+    let fixedSpaces = false;
+    const names = new Set();
+    for (let line of trimmed.split(/\r?\n/)) {
+        line = line.trim();
+        if (!line || (line.startsWith('#') && !line.startsWith('#HttpOnly_'))) continue;
+        let fields = line.split('\t');
+        if (fields.length < 7) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 7) {
+                fields = [...parts.slice(0, 6), parts.slice(6).join(' ')];
+                fixedSpaces = true;
+            }
+        }
+        if (fields.length < 7) continue;
+        const domain = fields[0].replace(/^#HttpOnly_/, '');
+        if (/(^|\.)youtube\.com$/i.test(domain) || /(^|\.)google\.com$/i.test(domain)) {
+            youtube++;
+            names.add(fields[5]);
+        }
+        out.push(fields.slice(0, 7).join('\t'));
+    }
+    if (fixedSpaces) problems.push('Tabs had been turned into spaces when pasting; this was repaired automatically.');
+    if (!youtube) problems.push('No youtube.com cookies were found in the file.');
+    const loggedIn = ['SAPISID', '__Secure-3PSID', 'LOGIN_INFO', 'SID'].some(n => names.has(n));
+    if (youtube && !loggedIn) problems.push('The YouTube cookies do not include a login. Log in to YouTube before exporting.');
+    return { text: `${out.join('\n')}\n`, problems, youtube, loggedIn };
+}
+
 function cookiesFile() {
     if (cookiesCopy !== undefined) return cookiesCopy;
     cookiesCopy = null;
     let text = null;
+    let source = null;
     try {
-        if (config.ytdlpCookies) text = fs.readFileSync(config.ytdlpCookies, 'utf8');
-        else if (process.env.YTDLP_COOKIES_BASE64) text = Buffer.from(process.env.YTDLP_COOKIES_BASE64, 'base64').toString('utf8');
-        else if (process.env.YTDLP_COOKIES_TEXT) text = process.env.YTDLP_COOKIES_TEXT.replace(/\\n/g, '\n');
+        if (config.ytdlpCookies) {
+            source = config.ytdlpCookies;
+            text = fs.readFileSync(config.ytdlpCookies, 'utf8');
+        } else if (process.env.YTDLP_COOKIES_BASE64) {
+            source = 'YTDLP_COOKIES_BASE64';
+            text = Buffer.from(process.env.YTDLP_COOKIES_BASE64, 'base64').toString('utf8');
+        } else if (process.env.YTDLP_COOKIES_TEXT) {
+            source = 'YTDLP_COOKIES_TEXT';
+            text = process.env.YTDLP_COOKIES_TEXT.replace(/\\n/g, '\n');
+        }
     } catch (err) {
-        console.error(`[yt-dlp] Could not read cookies file ${config.ytdlpCookies}: ${err.message}`);
+        cookieReport = { source, problems: [`Could not read ${source}: ${err.message}`], youtubeCookies: 0, loggedIn: false };
+        return cookiesCopy;
     }
-    if (text && text.trim()) {
+    if (!source) return cookiesCopy;
+    if (!text || !text.trim()) {
+        cookieReport = { source, problems: ['The cookies file is empty.'], youtubeCookies: 0, loggedIn: false };
+        return cookiesCopy;
+    }
+    const repaired = repairCookies(text);
+    cookieReport = { source, problems: repaired.problems, youtubeCookies: repaired.youtube, loggedIn: repaired.loggedIn };
+    if (repaired.text && repaired.youtube) {
         const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'musicbot-'));
         cookiesCopy = path.join(dir, 'cookies.txt');
-        fs.writeFileSync(cookiesCopy, text, { mode: 0o600 });
-        console.log('[yt-dlp] Using YouTube cookies.');
+        fs.writeFileSync(cookiesCopy, repaired.text, { mode: 0o600 });
     }
     return cookiesCopy;
+}
+
+/** Print what we found in the cookies file, so problems are visible in the logs. */
+function logCookieStatus() {
+    const file = cookiesFile();
+    const r = cookieReport;
+    if (!r.source) {
+        console.log('[COOKIES] No YouTube cookies configured. (Only needed if YouTube blocks this server.)');
+        return;
+    }
+    if (file) {
+        console.log(`[COOKIES] Loaded ${r.youtubeCookies} YouTube/Google cookies from ${r.source}${r.loggedIn ? ' (logged-in account)' : ''}.`);
+    } else {
+        console.warn(`[COOKIES] Cookies from ${r.source} could NOT be used.`);
+    }
+    for (const p of r.problems) console.warn(`[COOKIES] ${p}`);
+}
+
+let ytStatus = 'unknown';
+function youtubeStatus() {
+    return ytStatus;
+}
+
+/** Try to get a playable audio stream for a known video and log the result. */
+async function testYouTube() {
+    ytStatus = 'testing';
+    try {
+        const info = await getJson('https://www.youtube.com/watch?v=dQw4w9WgXcQ', ['--no-playlist', '-f', 'ba/ba*/b']);
+        if (!info.url && !info.requested_downloads?.length) throw new Error('no audio stream returned');
+        ytStatus = 'ok';
+        console.log('[YOUTUBE] Test passed: this server can play YouTube.');
+    } catch (err) {
+        const blocked = /confirm you.?re not a bot|Sign in to confirm/i.test(err.message);
+        ytStatus = blocked ? 'blocked' : 'error';
+        if (blocked) {
+            console.warn('[YOUTUBE] Test FAILED: YouTube is blocking this server ("Sign in to confirm you\'re not a bot").');
+            console.warn(cookieReport.source
+                ? '[YOUTUBE] Cookies were loaded but YouTube still refused them: export fresh cookies (see the guide). Songs will play from SoundCloud meanwhile.'
+                : '[YOUTUBE] Add a cookies.txt Secret File (see the guide). Songs will play from SoundCloud meanwhile.');
+        } else {
+            console.warn('[YOUTUBE] Test failed:', err.message.split('\n')[0]);
+        }
+    }
 }
 
 /** Arguments every yt-dlp call gets. */
@@ -164,4 +265,4 @@ function spawnAudio(url) {
     return spawn(binaryPath(), args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
 }
 
-module.exports = { ensure, getJson, spawnAudio, version, binaryPath };
+module.exports = { ensure, getJson, spawnAudio, version, binaryPath, logCookieStatus, testYouTube, youtubeStatus, repairCookies };

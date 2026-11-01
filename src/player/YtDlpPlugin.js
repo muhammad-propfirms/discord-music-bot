@@ -188,7 +188,28 @@ class YtDlpPlugin extends ExtractorPlugin {
 
     getStreamURL(song) {
         if (!song.url) throw new DisTubeError('YTDLP_ERROR', 'This song has no URL.');
-        return this.streamServer.urlFor(song.url);
+        return this.streamServer.urlFor(song.url, this.fallbackQuery(song));
+    }
+
+    /**
+     * Search text used to find a YouTube song on SoundCloud when YouTube blocks
+     * this server: the title without "(Official Video)", "| Label" and so on.
+     */
+    fallbackQuery(song) {
+        if (!youtubeIdOf(song.url) || !song.name) return null;
+        const NOISE = /\b(official|music video|lyric video|video song|full video|video|audio|lyrics?|lyrical|full song|hd|4k|uncut|remaster(ed)?|visualizer)\b/gi;
+        const parts = String(song.name)
+            .replace(/\(.*?\)|\[.*?\]/g, ' ')
+            .split(/[|]/)
+            .map(p => p.replace(NOISE, ' ').replace(/["'`:]/g, ' ').replace(/\s+-\s*$/g, '').replace(/\s+/g, ' ').trim())
+            .filter(p => p.length > 1);
+        // Title plus the next part (usually the artist), e.g. "So High Sidhu Moose Wala ft. BYG BYRD".
+        const query = parts.slice(0, 2).join(' ').replace(/\s+/g, ' ').trim();
+        // Fall back to the uploader name if the title alone is very short.
+        const withArtist = parts.length < 2 && !/\s-\s/.test(query) && song.uploader?.name
+            && !query.toLowerCase().includes(song.uploader.name.toLowerCase())
+            ? `${query} ${song.uploader.name}` : query;
+        return withArtist.slice(0, 120) || null;
     }
 
     /**

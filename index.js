@@ -54,8 +54,9 @@ for (const file of fs.readdirSync(eventsDir).filter(f => f.endsWith('.js'))) {
 client.on(Events.Error, error => console.error('[DISCORD] Client error:', error));
 client.on(Events.Warn, warning => console.warn('[DISCORD] Warning:', warning));
 
-// ---- Optional health-check web server (only when PORT is set) --------------
+// ---- Health-check web server (Render needs an open port) ------------------
 function startHealthServer() {
+    if (config.portWarning) console.warn(`[WEB] ${config.portWarning}`);
     if (!config.port) return;
     const express = require('express');
     const app = express();
@@ -63,6 +64,7 @@ function startHealthServer() {
     app.get('/healthz', (req, res) => res.json({
         status: 'ok',
         discord: client.isReady() ? 'connected' : 'connecting',
+        youtube: ytdlp.youtubeStatus(),
         uptimeSeconds: Math.round(process.uptime()),
     }));
     app.listen(config.port, '0.0.0.0', () => console.log(`[WEB] Health check on port ${config.port}`))
@@ -71,8 +73,12 @@ function startHealthServer() {
 
 // ---- Start ----------------------------------------------------------------
 async function main() {
+    // Open the port first so hosts like Render see the service as up right away.
+    startHealthServer();
+
     console.log('[STARTUP] Checking yt-dlp...');
     await ytdlp.ensure();
+    ytdlp.logCookieStatus();
 
     if (path.isAbsolute(config.ffmpegPath) && !fs.existsSync(config.ffmpegPath)) {
         console.warn(`[STARTUP] ffmpeg not found at ${config.ffmpegPath}. Set FFMPEG_PATH in .env.`);
@@ -81,10 +87,11 @@ async function main() {
     client.player = new PlayerManager(client);
     await client.player.start();
 
-    startHealthServer();
-
     console.log('[STARTUP] Logging in to Discord...');
     await client.login(config.token);
+
+    // Check in the background whether this server can actually play YouTube.
+    ytdlp.testYouTube().catch(() => {});
 }
 
 main().catch(error => {

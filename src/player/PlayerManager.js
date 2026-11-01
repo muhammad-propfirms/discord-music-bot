@@ -43,6 +43,10 @@ class PlayerManager {
         /** guildId -> timeout */
         this.aloneTimers = new Map();
         this.idleTimers = new Map();
+        /** song url -> time of the last stream error (to avoid duplicate messages) */
+        this.recentStreamErrors = new Map();
+        /** guildId -> time of the last "playing from SoundCloud" notice */
+        this.fallbackNotices = new Map();
 
         this.#registerEvents();
     }
@@ -92,19 +96,34 @@ class PlayerManager {
 
         d.on('error', (error, queue, song) => {
             console.error(`[PLAYER] Error${song ? ` while playing "${song.name}"` : ''}:`, error.message);
+            // ffmpeg fails right after a stream error we already explained; don't post a second message.
+            const recent = this.recentStreamErrors.get(song?.url);
+            if (recent && Date.now() - recent < 60_000) return;
             const where = song ? ` **${truncate(song.name, 80)}**` : '';
             queue?.textChannel?.send({ embeds: [embed('error', `❌ Could not play${where}: ${friendlyError(error)}`)] }).catch(() => {});
         });
 
         // yt-dlp failed to deliver audio (song would otherwise just silently skip).
         this.streamServer.on('streamError', (songUrl, error) => {
-            for (const queue of this.distube.queues.collection.values()) {
-                const current = queue.songs[0];
-                if (current?.url === songUrl) {
-                    queue.textChannel?.send({
-                        embeds: [embed('error', `❌ Could not stream **${truncate(current.name, 80)}**: ${friendlyError(error)}`)],
-                    }).catch(() => {});
-                }
+            this.recentStreamErrors.set(songUrl, Date.now());
+            if (this.recentStreamErrors.size > 200) this.recentStreamErrors.delete(this.recentStreamErrors.keys().next().value);
+            for (const queue of this.#queuesPlaying(songUrl)) {
+                queue.textChannel?.send({
+                    embeds: [embed('error', `❌ Could not stream **${truncate(queue.songs[0].name, 80)}**: ${friendlyError(error)}`)],
+                }).catch(() => {});
+            }
+        });
+
+        // YouTube blocked this server, so the song is coming from SoundCloud instead.
+        this.streamServer.on('fallback', songUrl => {
+            for (const queue of this.#queuesPlaying(songUrl)) {
+                const last = this.fallbackNotices.get(queue.id) ?? 0;
+                if (Date.now() - last < 15 * 60_000) continue; // say it once in a while, not for every song
+                this.fallbackNotices.set(queue.id, Date.now());
+                queue.textChannel?.send({
+                    embeds: [embed('warn', '⚠️ YouTube is blocking this server right now, so songs are being played from **SoundCloud** instead. '
+                        + 'The version may differ slightly. The bot owner can fix this by refreshing the YouTube cookies (see the guide).')],
+                }).catch(() => {});
             }
         });
 
@@ -150,7 +169,16 @@ class PlayerManager {
     #prefetchNext(queue) {
         if (queue.repeatMode === RepeatMode.SONG) return;
         const next = queue.songs[1] ?? (queue.repeatMode === RepeatMode.QUEUE ? queue.songs[0] : null);
-        if (next?.url && !next.isLive) this.streamServer.prefetch(next.url);
+        if (!next?.url || next.isLive) return;
+        this.streamServer.setFallbackQuery(next.url, this.plugin.fallbackQuery(next));
+        this.streamServer.prefetch(next.url);
+    }
+
+    /** Queues whose current song is `songUrl`. */
+    *#queuesPlaying(songUrl) {
+        for (const queue of this.distube.queues.collection.values()) {
+            if (queue.songs[0]?.url === songUrl) yield queue;
+        }
     }
 
     async #deleteNowPlaying(guildId) {

@@ -17,7 +17,7 @@ module.exports = {
             return respond(interaction, 'warn', `There are only ${voice.queue.songs.length} songs in the queue.`, { ephemeral: true });
         }
         const [song] = voice.queue.songs.splice(position - 1, 1);
-        client.player.streamServer.prefetch(voice.queue.songs[1]?.url);
+        client.player.prefetchNext(voice.queue);
         return respond(interaction, 'ok', `🗑️ Removed **${truncate(song.name, 100)}** from the queue.`);
     },
 };

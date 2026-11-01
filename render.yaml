@@ -32,3 +32,6 @@ services:
         value: "300"
       - key: YTDLP_AUTO_UPDATE
         value: "true"
+      - key: SOUNDCLOUD_FALLBACK   # play from SoundCloud if YouTube blocks Render
+        value: "true"
+      # Do NOT add PORT: Render sets it automatically (10000).

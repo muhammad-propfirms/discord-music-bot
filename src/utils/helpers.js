@@ -59,8 +59,11 @@ async function requireVoice(interaction, { needQueue = false } = {}) {
 function friendlyError(error) {
     const code = error?.errorCode;
     const msg = String(error?.message || error || '');
+    if (/no SoundCloud version/i.test(msg)) {
+        return 'YouTube is blocking this server and this song could not be found on SoundCloud either. Try another song, or ask the bot owner to refresh the YouTube cookies (setup guide, Part 6).';
+    }
     if (/Sign in to confirm|not a bot/i.test(msg)) {
-        return 'YouTube is blocking this server\'s IP ("confirm you\'re not a bot"). The bot owner needs to add YouTube cookies — see the setup guide, section "YouTube blocks".';
+        return 'YouTube is blocking this server ("confirm you\'re not a bot"). The bot owner needs to refresh the YouTube cookies (setup guide, Part 6).';
     }
     if (/Private video|This video is private/i.test(msg)) return 'That video is private.';
     if (/confirm your age|age[- ]restricted|inappropriate for some users/i.test(msg)) return 'That video is age-restricted. The bot owner can add YouTube cookies to allow it.';

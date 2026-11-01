@@ -11,7 +11,7 @@ module.exports = {
         if (!voice) return;
         if (voice.queue.songs.length < 3) return respond(interaction, 'warn', 'Need at least 2 upcoming songs to shuffle.', { ephemeral: true });
         await voice.queue.shuffle();
-        client.player.streamServer.prefetch(voice.queue.songs[1]?.url);
+        client.player.prefetchNext(voice.queue);
         return respond(interaction, 'ok', `🔀 Shuffled ${voice.queue.songs.length - 1} upcoming songs.`);
     },
 };
